@@ -1,0 +1,458 @@
+{
+  "name": "Checkout Incident Detection - Portfolio Template",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "b7b8e5e5-2fec-4b35-9368-b0f4b58f6326",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "state"
+        },
+        "options": {
+          "outputFormatting": {
+            "values": {
+              "general": "UNFORMATTED_VALUE",
+              "date": "SERIAL_NUMBER"
+            }
+          }
+        }
+      },
+      "id": "beb4bbe2-14fb-45e1-ab38-583b1b4f357c",
+      "name": "Read State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        272,
+        224
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {},
+      "id": "9309f3d2-81e9-41c8-97ca-e5eb90f14df1",
+      "name": "Run Manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "baseline_metrics"
+        },
+        "options": {}
+      },
+      "id": "d501fab8-8167-421a-b459-f6739edad862",
+      "name": "Read Baseline Metrics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        496,
+        240
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "cart_events"
+        },
+        "options": {
+          "outputFormatting": {
+            "values": {
+              "general": "UNFORMATTED_VALUE",
+              "date": "SERIAL_NUMBER"
+            }
+          }
+        }
+      },
+      "id": "b875ad42-a25f-400d-9742-a46f7590ca5d",
+      "name": "Read Cart Events",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        720,
+        224
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Business thresholds (document these in your submission)\nconst HIGH_CART_VALUE = 500;\nconst MOBILE_FAILURE_THRESHOLD = 2;\n\n// Timestamps are Excel/Sheets serial numbers (days since 1899-12-30)\nfunction toSerial(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return v;\n  const n = Number(v);\n  if (!isNaN(n)) return n;\n  const ms = Date.parse(v);\n  if (isNaN(ms)) return null;\n  return ms / 86400000 + 25569;\n}\nfunction serialToIso(s) {\n  return new Date(Math.round((s - 25569) * 86400000)).toISOString();\n}\nfunction normRate(r) {\n  const raw = String(r === undefined || r === null ? '' : r);\n  let n = Number(raw.replace('%', '').trim());\n  if (raw.trim() === '' || isNaN(n)) return null;\n  if (raw.includes('%') || n > 1) n = n / 100;\n  return n;\n}\nfunction pct(x) { return (x * 100).toFixed(1) + \"%\"; }\n\n// 1. State: last processed timestamp\nconst stateRow = $('Read State').all().map(i => i.json).find(r => String(r.key || '').trim() === 'last_processed_timestamp');\nconst lastTs = toSerial(stateRow ? stateRow.value : null) || 0;\n\n// 2. Baseline metrics per step\nconst baseline = {};\nfor (const item of $('Read Baseline Metrics').all()) {\n  const step = String(item.json.checkout_step || '').trim().toUpperCase();\n  if (step) baseline[step] = normRate(item.json.baseline_rate);\n}\n\n// 3. Only events newer than the stored state\nconst events = $('Read Cart Events').all()\n  .map(i => ({\n    ts: toSerial(i.json.timestamp),\n    step: String(i.json.checkout_step || '').trim().toUpperCase(),\n    device: String(i.json.device || '').trim().toUpperCase(),\n    value: Number(String(i.json.cart_value === undefined || i.json.cart_value === null ? '' : i.json.cart_value).replace(/[^0-9.\\-]/g, '')) || 0,\n  }))\n  .filter(e => e.ts !== null && e.ts > lastTs)\n  .sort((a, b) => a.ts - b.ts);\n\n// Nothing new: stop here (no command, no webhook, state unchanged)\nif (events.length === 0) return [];\n\n// 4. Metrics\nconst total = events.length;\nconst stepCounts = {};\nfor (const e of events) stepCounts[e.step] = (stepCounts[e.step] || 0) + 1;\nconst stepsOverBaseline = Object.keys(stepCounts).filter(s => baseline[s] !== undefined && baseline[s] !== null && stepCounts[s] / total > baseline[s]);\nconst paymentEvents = events.filter(e => e.step === 'PAYMENT');\nconst highValueEvents = events.filter(e => e.value >= HIGH_CART_VALUE);\nconst mobileEvents = events.filter(e => e.device === 'MOBILE');\nconst maxValue = Math.max(...events.map(e => e.value));\n\n// 5. Rules -> severity\nconst reasons = [];\nif (paymentEvents.length > 0) reasons.push(paymentEvents.length + ' failure(s) at PAYMENT step (revenue impact)');\nif (highValueEvents.length > 0) reasons.push(highValueEvents.length + ' high-value cart(s) >= ' + HIGH_CART_VALUE + ' (max ' + maxValue + ')');\nif (stepsOverBaseline.length > 0) reasons.push('failure rate above baseline: ' + stepsOverBaseline.map(s => s + ' ' + pct(stepCounts[s] / total) + ' vs ' + pct(baseline[s])).join(', '));\nif (mobileEvents.length >= MOBILE_FAILURE_THRESHOLD) reasons.push(mobileEvents.length + ' MOBILE failures (possible app bug)');\nconst severity = reasons.length > 0 ? 'HIGH' : 'LOW';\nconst action = severity === 'HIGH' ? 'ALERT' : 'LOG';\nconst reason = severity === 'HIGH'\n  ? 'Processed ' + total + ' new event(s): ' + reasons.join('; ')\n  : 'Processed ' + total + ' new event(s): low value, isolated incident, no payment failure, no rate above baseline';\n\n// 6. Primary event that represents this run\nconst byValue = (a, b) => (b.value - a.value) || (b.ts - a.ts);\nconst primary = paymentEvents.filter(e => e.value >= HIGH_CART_VALUE).sort(byValue)[0]\n  || paymentEvents.slice().sort(byValue)[0]\n  || highValueEvents.slice().sort(byValue)[0]\n  || events.slice().sort(byValue)[0];\n\nconst command = {\n  command_id: 'CMD-' + $execution.id + '-' + Date.now(),\n  action: action,\n  severity: severity,\n  reason: reason,\n  checkout_step: primary.step,\n  cart_value: primary.value,\n  device: primary.device,\n  baseline_rate: baseline[primary.step] === undefined || baseline[primary.step] === null ? '' : baseline[primary.step],\n  timestamp: serialToIso(primary.ts),\n};\n\nreturn [{ json: Object.assign({}, command, {\n  events_processed: total,\n  new_last_processed_timestamp: events[events.length - 1].ts,\n  webhook_payload: command,\n}) }];"
+      },
+      "id": "aa8fdaf4-a5c6-4762-8b0b-78905b65f8e4",
+      "name": "Evaluate New Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        224
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": false,
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_commands"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "command_id": "={{ $json.command_id }}",
+            "action": "={{ $json.action }}",
+            "severity": "={{ $json.severity }}",
+            "reason": "={{ $json.reason }}",
+            "checkout_step": "={{ $json.checkout_step }}",
+            "cart_value": "={{ $json.cart_value }}",
+            "device": "={{ $json.device }}",
+            "baseline_rate": "={{ $json.baseline_rate }}",
+            "timestamp": "={{ $json.timestamp }}"
+          },
+          "schema": [
+            {
+              "id": "command_id",
+              "displayName": "command_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "checkout_step",
+              "displayName": "checkout_step",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "cart_value",
+              "displayName": "cart_value",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "device",
+              "displayName": "device",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "baseline_rate",
+              "displayName": "baseline_rate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "01095c5c-bdf9-4ac7-bd4a-3cd502c11def",
+      "name": "Write Agent Command",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1296,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://example.invalid/replace-with-your-webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($(\"Evaluate New Events\").item.json.webhook_payload) }}",
+        "options": {}
+      },
+      "id": "040095db-eba5-497c-9b9e-743fb6b102e6",
+      "name": "Broadcast Command Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1536,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "state"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "key": "last_processed_timestamp",
+            "value": "={{ $(\"Evaluate New Events\").item.json.new_last_processed_timestamp }}"
+          },
+          "matchingColumns": [
+            "key"
+          ],
+          "schema": [
+            {
+              "id": "key",
+              "displayName": "key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "value",
+              "displayName": "value",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "892a79c5-3816-4fa9-b180-609cf229495c",
+      "name": "Update State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1744,
+        224
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Read State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read State": {
+      "main": [
+        [
+          {
+            "node": "Read Baseline Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Read State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Baseline Metrics": {
+      "main": [
+        [
+          {
+            "node": "Read Cart Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Cart Events": {
+      "main": [
+        [
+          {
+            "node": "Evaluate New Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate New Events": {
+      "main": [
+        [
+          {
+            "node": "Write Agent Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Agent Command": {
+      "main": [
+        [
+          {
+            "node": "Broadcast Command Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Broadcast Command Webhook": {
+      "main": [
+        [
+          {
+            "node": "Update State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [
+    {
+      "id": "c3790bfa-9c26-4173-bb46-d3c73ef5730d",
+      "name": "Triage new checkout events",
+      "nodeIds": [
+        "beb4bbe2-14fb-45e1-ab38-583b1b4f357c",
+        "d501fab8-8167-421a-b459-f6739edad862",
+        "b875ad42-a25f-400d-9742-a46f7590ca5d",
+        "aa8fdaf4-a5c6-4762-8b0b-78905b65f8e4"
+      ],
+      "description": "Loads last run state, baseline rates and new cart events, then rates severity and picks ALERT or LOG"
+    },
+    {
+      "id": "cdf9af54-95fa-4837-9152-a47e52568c57",
+      "name": "Publish command",
+      "nodeIds": [
+        "01095c5c-bdf9-4ac7-bd4a-3cd502c11def",
+        "040095db-eba5-497c-9b9e-743fb6b102e6",
+        "892a79c5-3816-4fa9-b180-609cf229495c"
+      ],
+      "description": "Logs one command row, broadcasts it to downstream systems, then moves the state forward to avoid duplicates"
+    }
+  ],
+  "tags": []
+}
